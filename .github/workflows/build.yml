@@ -30,18 +30,6 @@ on:
         description: "xz preset: 9e = smallest/slow, 6 = balanced, 1 = fast"
         required: false
         default: "9e"
-      publish_release:
-        description: "Publish a GitHub Release (otherwise upload as artifact)"
-        type: boolean
-        default: true
-      rom_name:
-        description: "ROM name for the Telegram post (optional)"
-        required: false
-        default: ""
-      telegram_photo_url:
-        description: "Photo URL for the Telegram post header (optional)"
-        required: false
-        default: ""
 
 permissions:
   contents: write
@@ -292,37 +280,52 @@ jobs:
           if [ -z "$(find "$OUT_DIR" -type l)" ]; then rm -rf tmp; fi
           df -h /
 
-      - name: Compress (xz) and split for release limits
+      - name: Compress (xz)
         run: |
-          limit=$((1900 * 1024 * 1024))
           find "$OUT_DIR" -maxdepth 1 -type f -iname '*.img' -print0 \
             | while IFS= read -r -d '' f; do
                 echo "Compressing: $f (xz -$XZ_LEVEL)"
                 xz -"$XZ_LEVEL" -T0 -v "$f"
-                size=$(stat -c%s "$f.xz")
-                if [ "$size" -gt "$limit" ]; then
-                  echo "$(( size / 1048576 )) MiB - splitting into 1900 MiB parts"
-                  split -d -a 2 -b 1900M "$f.xz" "$f.xz."
-                  rm "$f.xz"
-                fi
               done
-          (cd "$OUT_DIR" && sha256sum *.xz* > SHA256SUMS.txt)
+          (cd "$OUT_DIR" && sha256sum *.xz > SHA256SUMS.txt)
           ls -lh "$OUT_DIR"
 
+      - name: Upload to Gofile
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}
+        run: |
+          folder=""; guest=""; page=""
+          for f in "$OUT_DIR"/*.xz; do
+            echo "Uploading $f"
+            token="${GOFILE_TOKEN:-$guest}"
+            args=(-fsS --retry 3 --retry-delay 10 -F "file=@$f")
+            if [ -n "$folder" ]; then args+=(-F "folderId=$folder"); fi
+            if [ -n "$token" ];  then args+=(-H "Authorization: Bearer $token"); fi
+            resp=$(curl "${args[@]}" https://upload.gofile.io/uploadfile)
+            if [ "$(jq -r '.status' <<<"$resp")" != "ok" ]; then
+              echo "::error::Gofile upload failed"
+              jq -c 'del(.data.guestToken)' <<<"$resp" || true
+              exit 1
+            fi
+            folder=$(jq -r '.data.parentFolder' <<<"$resp")
+            page=$(jq -r '.data.downloadPage' <<<"$resp")
+            if [ -z "$guest" ]; then
+              guest=$(jq -r '.data.guestToken // empty' <<<"$resp")
+              if [ -n "$guest" ]; then echo "::add-mask::$guest"; fi
+            fi
+          done
+          echo "Gofile: $page"
+          echo "GOFILE_URL=$page" >> "$GITHUB_ENV"
+
       - name: Publish release
-        if: ${{ inputs.publish_release }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           tag="gsi-${BUILD_NAME}-$(date +%Y%m%d%H%M%S)"
           {
-            echo "Verify with SHA256SUMS.txt."
+            echo "**Download:** $GOFILE_URL"
             echo
-            echo "If the image is split (*.xz.00, *.xz.01, ...), reassemble with:"
-            echo '```'
-            echo 'cat system.img.xz.* > system.img.xz && xz -d system.img.xz'
-            echo '```'
-            echo "Single-file releases need no reassembly."
+            echo "Image is \`.img.xz\` - extract with \`xz -d\`. Verify with SHA256SUMS.txt."
             if [ -f "$OUT_DIR/output.txt" ]; then
               echo
               echo '```'
@@ -330,67 +333,6 @@ jobs:
               echo '```'
             fi
           } > notes.md
-          gh release create "$tag" "$OUT_DIR"/*.xz* "$OUT_DIR"/*.txt \
+          gh release create "$tag" "$OUT_DIR"/*.txt \
             --target "$GITHUB_SHA" --title "$BUILD_NAME" --notes-file notes.md
-          url=$(gh release view "$tag" --json url -q .url)
-          echo "Release: $url"
-          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
-
-      - name: Upload artifact (when not publishing a release)
-        if: ${{ !inputs.publish_release }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ inputs.build_name }}
-          path: |
-            ${{ env.OUT_DIR }}/*.xz*
-            ${{ env.OUT_DIR }}/*.txt
-          compression-level: 0
-          retention-days: 7
-
-      - name: Notify Telegram
-        if: ${{ success() && inputs.publish_release }}
-        continue-on-error: true
-        env:
-          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          ROM_NAME: ${{ inputs.rom_name }}
-          PHOTO_URL: ${{ inputs.telegram_photo_url }}
-          POST_TITLE: "MysticGSI"   # <- change to your channel branding
-        run: |
-          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
-            echo "Telegram secrets not set - skipping"
-            exit 0
-          fi
-          esc()  { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
-          trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
-
-          txt="$OUT_DIR/output.txt"
-          device=""
-          summary=""
-          if [ -f "$txt" ]; then
-            device=$(grep -im1 '^Device name:' "$txt" | cut -d: -f2- | trim || true)
-            if [ -z "$device" ]; then
-              brand=$(grep -im1 '^Device brand:' "$txt" | cut -d: -f2- | trim || true)
-              model=$(grep -im1 '^Device model:' "$txt" | cut -d: -f2- | trim || true)
-              device=$(printf '%s %s' "$brand" "$model" | trim)
-            fi
-            summary=$(head -c 700 "$txt" | esc)
-          fi
-          if [ -z "$device" ]; then device="$BUILD_NAME"; fi
-          url="${RELEASE_URL:-https://github.com/$GITHUB_REPOSITORY/releases}"
-
-          caption=$(printf '<b>%s</b>\n<b>Ported From:</b> %s\n<b>ROM:</b> %s\n\n<code>%s</code>\n\n<b>Download:</b> <a href="%s">GitHub</a>' \
-            "$(printf %s "$POST_TITLE" | esc)" "$(printf %s "$device" | esc)" \
-            "$(printf %s "$ROM_NAME" | esc)" "$summary" "$url")
-
-          if [ -n "$PHOTO_URL" ]; then
-            jq -n --arg c "$CHAT_ID" --arg p "$PHOTO_URL" --arg t "$caption" \
-              '{chat_id:$c, photo:$p, caption:$t, parse_mode:"HTML"}' \
-              | curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
-                  -H 'Content-Type: application/json' -d @-
-          else
-            jq -n --arg c "$CHAT_ID" --arg t "$caption" \
-              '{chat_id:$c, text:$t, parse_mode:"HTML"}' \
-              | curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-                  -H 'Content-Type: application/json' -d @-
-          fi
+          echo "Release: $(gh release view "$tag" --json url -q .url)"
