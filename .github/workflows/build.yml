@@ -103,7 +103,7 @@ jobs:
         run: |
           mkdir -p dl
           case "$FIRMWARE_URL" in
-            *drive.google.com*|*docs.google.com*)
+            *drive.google.com*|*drive.usercontent.google.com*|*docs.google.com*)
               echo "Source: Google Drive"
               .venv/bin/python -m pip install -q gdown
               if [ -n "${GDRIVE_COOKIES:-}" ]; then
@@ -113,7 +113,14 @@ jobs:
               if [[ "$FIRMWARE_URL" == *"/folders/"* ]]; then
                 .venv/bin/python -m gdown --folder "$FIRMWARE_URL" -O dl/
               else
-                .venv/bin/python -m gdown --fuzzy "$FIRMWARE_URL" -O dl/
+                id=$(printf '%s' "$FIRMWARE_URL" \
+                  | grep -oE '(/d/|[?&]id=)[A-Za-z0-9_-]+' | head -n1 \
+                  | sed -E 's#^(/d/|[?&]id=)##' || true)
+                if [ -n "$id" ]; then
+                  .venv/bin/python -m gdown "https://drive.google.com/uc?id=${id}" -O dl/
+                else
+                  .venv/bin/python -m gdown --fuzzy "$FIRMWARE_URL" -O dl/
+                fi
               fi
               ;;
             *mega.nz*|*mega.co.nz*)
@@ -128,6 +135,11 @@ jobs:
           esac
           if ! find dl -type f | grep -q .; then
             echo "::error::download produced no files"
+            exit 1
+          fi
+          if find dl -type f -size -5M -print0 | xargs -0 -r file | grep -qi 'html'; then
+            echo "::error::got an HTML page instead of firmware (Drive quota/permission/confirm page). Check sharing is 'Anyone with the link', or set GDRIVE_COOKIES."
+            find dl -type f -size -5M -exec head -c 400 {} \;
             exit 1
           fi
           find dl -type f -exec ls -lh {} \;
@@ -148,8 +160,13 @@ jobs:
               *.rar) 7z x -y -o"$2" "$1" >/dev/null || unrar-free -x "$1" "$2"/ ;;
               *.tar|*.tgz|*.tar.gz|*.tar.bz2|*.tar.xz|*.gz|*.bz2|*.xz)
                      tar -xf "$1" -C "$2" ;;
-              *)     if is_zip "$1"; then unzip -qo "$1" -d "$2"
-                     else 7z x -y -o"$2" "$1" >/dev/null; fi ;;
+              *)     case "$(file -b --mime-type "$1")" in
+                       application/zip|application/x-zip*|application/java-archive)
+                         unzip -qo "$1" -d "$2" ;;
+                       application/x-tar|application/gzip|application/x-xz|application/x-bzip2)
+                         tar -xf "$1" -C "$2" ;;
+                       *) 7z x -y -o"$2" "$1" >/dev/null ;;
+                     esac ;;
             esac
           }
 
