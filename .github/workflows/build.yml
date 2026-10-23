@@ -1,0 +1,379 @@
+name: MysticGSI Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_name:
+        description: "Build name (out/<name>/) - letters, numbers, . _ -"
+        required: true
+        default: "devicename-gsi"
+      firmware_url:
+        description: "Firmware URL (Google Drive, Mega.nz or direct link)"
+        required: true
+      rom_type:
+        description: "--type value, empty = auto (e.g. pixel, or TYPE:CUSTOM)"
+        required: false
+        default: ""
+      tag:
+        description: "Tag appended to the build name (--add)"
+        required: false
+        default: ""
+      no_debloat:
+        description: "Keep apps the patch set would remove"
+        type: boolean
+        default: false
+      no_merge:
+        description: "Build separate partition images"
+        type: boolean
+        default: false
+      xz_level:
+        description: "xz preset: 9e = smallest/slow, 6 = balanced, 1 = fast"
+        required: false
+        default: "9e"
+      publish_release:
+        description: "Publish a GitHub Release (otherwise upload as artifact)"
+        type: boolean
+        default: true
+      rom_name:
+        description: "ROM name for the Telegram post (optional)"
+        required: false
+        default: ""
+      telegram_photo_url:
+        description: "Photo URL for the Telegram post header (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    env:
+      BUILD_NAME: ${{ inputs.build_name }}
+      FIRMWARE_URL: ${{ inputs.firmware_url }}
+      ROM_TYPE: ${{ inputs.rom_type }}
+      TAG: ${{ inputs.tag }}
+      NO_DEBLOAT: ${{ inputs.no_debloat }}
+      NO_MERGE: ${{ inputs.no_merge }}
+      XZ_LEVEL: ${{ inputs.xz_level }}
+
+    steps:
+      - name: Validate inputs
+        run: |
+          if ! [[ "$BUILD_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::build_name may only contain letters, numbers, . _ -"
+            exit 1
+          fi
+          if ! [[ "$XZ_LEVEL" =~ ^[0-9]e?$ ]]; then
+            echo "::error::xz_level must look like 6, 9 or 9e"
+            exit 1
+          fi
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -a -f || true
+          df -h /
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl aria2 openssl patch ca-certificates \
+            libarchive-tools default-jre-headless erofs-utils p7zip-full \
+            unrar-free xz-utils unzip file jq
+          python -m venv .venv
+          .venv/bin/python -m pip install -r requirements.txt
+
+      - name: Download firmware
+        env:
+          GDRIVE_COOKIES: ${{ secrets.GDRIVE_COOKIES }}
+        run: |
+          mkdir -p dl
+          case "$FIRMWARE_URL" in
+            *drive.google.com*|*docs.google.com*)
+              echo "Source: Google Drive"
+              .venv/bin/python -m pip install -q gdown
+              if [ -n "${GDRIVE_COOKIES:-}" ]; then
+                mkdir -p ~/.cache/gdown
+                printf '%s\n' "$GDRIVE_COOKIES" > ~/.cache/gdown/cookies.txt
+              fi
+              if [[ "$FIRMWARE_URL" == *"/folders/"* ]]; then
+                .venv/bin/python -m gdown --folder "$FIRMWARE_URL" -O dl/
+              else
+                .venv/bin/python -m gdown --fuzzy "$FIRMWARE_URL" -O dl/
+              fi
+              ;;
+            *mega.nz*|*mega.co.nz*)
+              echo "Source: Mega.nz"
+              sudo apt-get install -y megatools
+              megadl --path dl/ "$FIRMWARE_URL"
+              ;;
+            *)
+              echo "Source: direct link"
+              aria2c -d dl -x4 -s4 -c "$FIRMWARE_URL"
+              ;;
+          esac
+          if ! find dl -type f | grep -q .; then
+            echo "::error::download produced no files"
+            exit 1
+          fi
+          find dl -type f -exec ls -lh {} \;
+
+      - name: Locate firmware for the CLI
+        run: |
+          is_zip()  { [ -f "$1" ] && unzip -Z1 "$1" >/dev/null 2>&1; }
+          zip_has() { unzip -Z1 "$1" 2>/dev/null | grep -qiE "$2"; }
+          first()   { find "$1" -type f -iname "$2" ! -iname 'super_empty*' -print -quit; }
+          largest() { find "$1" -type f -iname "${2:-*}" -printf '%s %p\n' \
+                        | sort -rn | head -n1 | cut -d' ' -f2-; }
+
+          extract() {  # file dir
+            mkdir -p "$2"
+            case "${1,,}" in
+              *.zip|*.apk|*.jar) unzip -qo "$1" -d "$2" ;;
+              *.7z)  7z x -y -o"$2" "$1" >/dev/null ;;
+              *.rar) 7z x -y -o"$2" "$1" >/dev/null || unrar-free -x "$1" "$2"/ ;;
+              *.tar|*.tgz|*.tar.gz|*.tar.bz2|*.tar.xz|*.gz|*.bz2|*.xz)
+                     tar -xf "$1" -C "$2" ;;
+              *)     if is_zip "$1"; then unzip -qo "$1" -d "$2"
+                     else 7z x -y -o"$2" "$1" >/dev/null; fi ;;
+            esac
+          }
+
+          FW=""; KIND=""
+          detect() {  # dir, archive that was extracted into it (may be empty)
+            local d="$1" arc="$2" f pair
+            FW=""; KIND=""
+            for pair in \
+              'UPDATE.APP|Huawei UPDATE.APP' '*.kdz|LG KDZ' '*.ozip|Oppo OZIP' \
+              '*.sin|Sony SIN' 'AP_*.tar*|Samsung AP tar' '*.tar.md5|Samsung tar' \
+              '*.tar|tar' '*.pac|Unisoc PAC' 'payload.bin|payload.bin' \
+              'super*.img|super.img'; do
+              f=$(first "$d" "${pair%%|*}")
+              if [ -n "$f" ]; then FW="$f"; KIND="${pair#*|}"; return 0; fi
+            done
+            f=$(first "$d" 'rawprogram*.xml')
+            if [ -n "$f" ]; then FW="$(dirname "$f")"; KIND="QFIL dir"; return 0; fi
+            f=$(first "$d" 'system.new.dat')
+            if [ -n "$f" ]; then FW="$(dirname "$f")"; KIND="system.new.dat dir"; return 0; fi
+            f=$(find "$d" -type f \( -iname 'system.img' -o -iname 'system_a.img' \
+                  -o -iname 'system_b.img' -o -iname 'system-*.img' \) -print -quit)
+            if [ -n "$f" ]; then
+              if [ -n "$(find "$(dirname "$f")" -maxdepth 1 -type f \( -iname 'product*.img' \
+                    -o -iname 'vendor*.img' -o -iname 'odm*.img' \) -print -quit)" ] \
+                 && is_zip "$arc"; then
+                FW="$arc"; KIND="split-partition zip"
+              else
+                FW="$f"; KIND="system.img"
+              fi
+              return 0
+            fi
+            f=$(find "$d" -type f -iname '*.img' ! -iname 'bootloader*' ! -iname 'vbmeta*' \
+                  ! -iname 'dtbo*' ! -iname 'dtb*' ! -iname 'modem*' ! -iname 'radio*' \
+                  ! -iname 'super_empty*' -print -quit)
+            if [ -n "$f" ]; then FW="$f"; KIND="*.img fallback"; fi
+            return 0
+          }
+
+          # Folder download (several files): look at the folder itself first
+          if [ "$(find dl -type f | wc -l)" -gt 1 ]; then
+            detect dl ""
+          fi
+
+          if [ -z "$FW" ]; then
+            CUR="$(largest dl)"
+            for round in 1 2 3; do
+              echo "Round $round: $CUR"
+              case "${CUR,,}" in
+                *.kdz|*.ozip|*.sin|*.pac|*.tar|*.tar.md5|*.img|*.app)
+                  FW="$CUR"; KIND="direct format"; break ;;
+              esac
+              # OTA zips and Pixel factory zips are passed as-is (no extraction)
+              if is_zip "$CUR" && zip_has "$CUR" '(^|/)(payload\.bin|image-[^/]*\.zip)$'; then
+                FW="$CUR"; KIND="OTA / factory zip"; break
+              fi
+              ex="extracted_$round"; rm -rf "$ex"
+              extract "$CUR" "$ex"
+              find "$ex" -maxdepth 4 -type f | sort | head -60
+              detect "$ex" "$CUR"
+              [ -n "$FW" ] && break
+              nested="$(largest "$ex" '*.zip' || true)"
+              [ -n "$nested" ] || break
+              CUR="$nested"
+            done
+          fi
+
+          if [ -z "$FW" ]; then
+            echo "::error::no recognizable firmware found"
+            find dl extracted_* -type f 2>/dev/null | sort | head -100
+            exit 1
+          fi
+          echo "Firmware type: $KIND"
+          echo "Firmware path: $FW"
+          echo "FIRMWARE_FILE=$FW" >> "$GITHUB_ENV"
+
+      - name: Build GSI
+        run: |
+          args=(build "$BUILD_NAME" "$FIRMWARE_FILE")
+          if [ -n "$ROM_TYPE" ];            then args+=(--type "$ROM_TYPE"); fi
+          if [ -n "$TAG" ];                 then args+=(--add "$TAG"); fi
+          if [ "$NO_DEBLOAT" = "true" ];    then args+=(--no-debloat); fi
+          if [ "$NO_MERGE" = "true" ];      then args+=(--no-merge); fi
+          .venv/bin/python cli.py "${args[@]}" 2>&1 | tee build.log
+
+      - name: Find output and write output.txt
+        run: |
+          OUT_DIR=$(python3 - <<'PY'
+          import json, os, re, html
+          name = os.environ["BUILD_NAME"]
+          fallback = os.path.join("out", name)
+          try:
+              with open("tmp/gsilist.json") as f:
+                  entries = json.load(f)
+              e = next(x for x in reversed(entries) if x.get("rom_name") == name)
+          except Exception:
+              print(fallback)
+              raise SystemExit
+          imgs = list((e.get("output_images") or {}).values())
+          d = os.path.dirname(imgs[0]) if imgs else fallback
+          text = (e.get("output") or "").split("\nDownload: ")[0]
+          text = html.unescape(re.sub(r"<[^>]+>", "", text)).strip()
+          p = os.path.join(d, "output.txt")
+          if text and not os.path.exists(p):
+              try:
+                  with open(p, "w") as f:
+                      f.write(text + "\n")
+              except OSError:
+                  pass
+          print(d)
+          PY
+          )
+          if ! ls "$OUT_DIR"/*.img >/dev/null 2>&1; then
+            echo "::error::no .img files in $OUT_DIR"
+            ls -la out || true
+            exit 1
+          fi
+          echo "OUT_DIR=$OUT_DIR" >> "$GITHUB_ENV"
+          ls -lh "$OUT_DIR"
+
+      - name: Free space before compressing
+        run: |
+          rm -rf dl extracted_*
+          if [ -z "$(find "$OUT_DIR" -type l)" ]; then rm -rf tmp; fi
+          df -h /
+
+      - name: Compress (xz) and split for release limits
+        run: |
+          limit=$((1900 * 1024 * 1024))
+          find "$OUT_DIR" -maxdepth 1 -type f -iname '*.img' -print0 \
+            | while IFS= read -r -d '' f; do
+                echo "Compressing: $f (xz -$XZ_LEVEL)"
+                xz -"$XZ_LEVEL" -T0 -v "$f"
+                size=$(stat -c%s "$f.xz")
+                if [ "$size" -gt "$limit" ]; then
+                  echo "$(( size / 1048576 )) MiB - splitting into 1900 MiB parts"
+                  split -d -a 2 -b 1900M "$f.xz" "$f.xz."
+                  rm "$f.xz"
+                fi
+              done
+          (cd "$OUT_DIR" && sha256sum *.xz* > SHA256SUMS.txt)
+          ls -lh "$OUT_DIR"
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="gsi-${BUILD_NAME}-$(date +%Y%m%d%H%M%S)"
+          {
+            echo "Verify with SHA256SUMS.txt."
+            echo
+            echo "If the image is split (*.xz.00, *.xz.01, ...), reassemble with:"
+            echo '```'
+            echo 'cat system.img.xz.* > system.img.xz && xz -d system.img.xz'
+            echo '```'
+            echo "Single-file releases need no reassembly."
+            if [ -f "$OUT_DIR/output.txt" ]; then
+              echo
+              echo '```'
+              cat "$OUT_DIR/output.txt"
+              echo '```'
+            fi
+          } > notes.md
+          gh release create "$tag" "$OUT_DIR"/*.xz* "$OUT_DIR"/*.txt \
+            --target "$GITHUB_SHA" --title "$BUILD_NAME" --notes-file notes.md
+          url=$(gh release view "$tag" --json url -q .url)
+          echo "Release: $url"
+          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
+
+      - name: Upload artifact (when not publishing a release)
+        if: ${{ !inputs.publish_release }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.build_name }}
+          path: |
+            ${{ env.OUT_DIR }}/*.xz*
+            ${{ env.OUT_DIR }}/*.txt
+          compression-level: 0
+          retention-days: 7
+
+      - name: Notify Telegram
+        if: ${{ success() && inputs.publish_release }}
+        continue-on-error: true
+        env:
+          BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ROM_NAME: ${{ inputs.rom_name }}
+          PHOTO_URL: ${{ inputs.telegram_photo_url }}
+          POST_TITLE: "MysticGSI"   # <- change to your channel branding
+        run: |
+          if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram secrets not set - skipping"
+            exit 0
+          fi
+          esc()  { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+          trim() { sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+
+          txt="$OUT_DIR/output.txt"
+          device=""
+          summary=""
+          if [ -f "$txt" ]; then
+            device=$(grep -im1 '^Device name:' "$txt" | cut -d: -f2- | trim || true)
+            if [ -z "$device" ]; then
+              brand=$(grep -im1 '^Device brand:' "$txt" | cut -d: -f2- | trim || true)
+              model=$(grep -im1 '^Device model:' "$txt" | cut -d: -f2- | trim || true)
+              device=$(printf '%s %s' "$brand" "$model" | trim)
+            fi
+            summary=$(head -c 700 "$txt" | esc)
+          fi
+          if [ -z "$device" ]; then device="$BUILD_NAME"; fi
+          url="${RELEASE_URL:-https://github.com/$GITHUB_REPOSITORY/releases}"
+
+          caption=$(printf '<b>%s</b>\n<b>Ported From:</b> %s\n<b>ROM:</b> %s\n\n<code>%s</code>\n\n<b>Download:</b> <a href="%s">GitHub</a>' \
+            "$(printf %s "$POST_TITLE" | esc)" "$(printf %s "$device" | esc)" \
+            "$(printf %s "$ROM_NAME" | esc)" "$summary" "$url")
+
+          if [ -n "$PHOTO_URL" ]; then
+            jq -n --arg c "$CHAT_ID" --arg p "$PHOTO_URL" --arg t "$caption" \
+              '{chat_id:$c, photo:$p, caption:$t, parse_mode:"HTML"}' \
+              | curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto" \
+                  -H 'Content-Type: application/json' -d @-
+          else
+            jq -n --arg c "$CHAT_ID" --arg t "$caption" \
+              '{chat_id:$c, text:$t, parse_mode:"HTML"}' \
+              | curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+                  -H 'Content-Type: application/json' -d @-
+          fi
